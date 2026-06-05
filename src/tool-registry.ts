@@ -180,9 +180,43 @@ export class ToolRegistry {
   private toolToModule = new Map<string, ToolModule>();
   private allToolDefs: Tool[] = [];
   private profile: ToolProfile = readToolProfile();
+  private defaultLocationId: string;
 
   constructor(ghlClient: GHLApiClient) {
+    // The configured GHL_LOCATION_ID (or per-request override) so location-scoped
+    // tools don't force the caller to repeat it on every call.
+    this.defaultLocationId = ghlClient.getConfig?.().locationId || '';
     this.initModules(ghlClient);
+  }
+
+  // ─── Location-id defaulting ─────────────────────────────────
+  // Many tools take a `locationId`/`location_id` that simply identifies the
+  // configured sub-account. The MCP config already carries GHL_LOCATION_ID, so
+  // inject it whenever a tool accepts one but the caller omitted it. Without
+  // this, calls like get_location_tags hit `/locations/undefined/tags`.
+  private static readonly LOCATION_KEYS = ['locationId', 'location_id'] as const;
+
+  // Drop locationId/location_id from a schema's `required` list when we have a
+  // configured default, so clients present it as optional rather than mandatory.
+  private relaxLocationRequirement(schema: any): any {
+    if (!this.defaultLocationId || !schema || !Array.isArray(schema.required)) return schema;
+    const keys = ToolRegistry.LOCATION_KEYS as readonly string[];
+    if (!schema.required.some((r: string) => keys.includes(r))) return schema;
+    return { ...schema, required: schema.required.filter((r: string) => !keys.includes(r)) };
+  }
+
+  private applyLocationDefault(tool: Tool, args: Record<string, unknown>): Record<string, unknown> {
+    if (!this.defaultLocationId) return args;
+    const props = ((tool as any).inputSchema?.properties || {}) as Record<string, unknown>;
+    let next = args;
+    for (const key of ToolRegistry.LOCATION_KEYS) {
+      if (!(key in props)) continue;
+      const current = next[key];
+      if (current === undefined || current === null || current === '') {
+        next = { ...next, [key]: this.defaultLocationId };
+      }
+    }
+    return next;
   }
 
   private initModules(ghl: GHLApiClient): void {
@@ -322,8 +356,48 @@ export class ToolRegistry {
     }
   }
 
+  // ─── Tool-name capping ──────────────────────────────────────
+  // MCP clients reject tool names > 64 chars and reject duplicates. We expose a
+  // capped, de-duplicated name per tool-def (stable within a process) on BOTH the
+  // stdio path (getAllToolDefinitions) and the HTTP path (registerAll), and reverse
+  // it in callTool() so execution still dispatches on the original internal name.
+  private defToExposed = new Map<Tool, string>();
+  private exposedToOriginal = new Map<string, string>();
+  private nameMapsBuilt = false;
+
+  private capName(name: string, used: Set<string>): string {
+    // The 64-char limit on some surfaces applies to the NAMESPACED name
+    // (e.g. "mcp__ghlcrm__<tool>"), so cap the bare name well under 64 to leave
+    // room for the prefix. 50 covers a "mcp__<=9char>__" prefix.
+    const MAX = 50;
+    let candidate = name.length <= MAX ? name : name.slice(0, MAX);
+    if (!used.has(candidate)) return candidate;
+    for (let i = 0; ; i++) {
+      const suffix = '_' + i.toString(36);
+      candidate = name.slice(0, MAX - suffix.length) + suffix;
+      if (!used.has(candidate)) return candidate;
+    }
+  }
+
+  private ensureNameMaps(): void {
+    if (this.nameMapsBuilt) return;
+    const used = new Set<string>();
+    for (const tool of this.allToolDefs) {
+      const exposed = this.capName(tool.name, used);
+      used.add(exposed);
+      this.defToExposed.set(tool, exposed);
+      this.exposedToOriginal.set(exposed, tool.name);
+    }
+    this.nameMapsBuilt = true;
+  }
+
+  private exposedName(tool: Tool): string {
+    this.ensureNameMaps();
+    return this.defToExposed.get(tool) ?? tool.name;
+  }
+
   /**
-   * Register all tools with a McpServer instance
+   * Register all tools with a McpServer instance (HTTP path)
    */
   registerAll(server: McpServer): number {
     let count = 0;
@@ -334,10 +408,11 @@ export class ToolRegistry {
 
       const meta = (tool as any)._meta;
       const annotations = inferAnnotations(tool.name, meta);
+      const exposedName = this.exposedName(tool);
 
       try {
         server.registerTool(
-          tool.name,
+          exposedName,
           {
             title: annotations.title,
             description: tool.description || '',
@@ -346,7 +421,7 @@ export class ToolRegistry {
           },
           async (args: any) => {
             try {
-              const result = await mod.executeTool(tool.name, args || {});
+              const result = await mod.executeTool(tool.name, this.applyLocationDefault(tool, args || {}));
               // Normalize result to MCP format
               const text = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
               return {
@@ -373,10 +448,14 @@ export class ToolRegistry {
    * Call a tool directly (for REST endpoint)
    */
   async callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
-    const mod = this.toolToModule.get(name);
+    this.ensureNameMaps();
+    // Accept either the exposed (capped) name or the original internal name.
+    const original = this.exposedToOriginal.get(name) ?? name;
+    const mod = this.toolToModule.get(original);
     if (!mod) return undefined;
-    if (!this.isToolVisible(name)) return undefined;
-    return mod.executeTool(name, args);
+    if (!this.isToolVisible(original)) return undefined;
+    const tool = this.allToolDefs.find((item) => item.name === original);
+    return mod.executeTool(original, tool ? this.applyLocationDefault(tool, args) : args);
   }
 
   /**
@@ -404,12 +483,15 @@ export class ToolRegistry {
    * Get all tool definitions (for REST /tools endpoint)
    */
   getAllToolDefinitions(): Tool[] {
-    // Add annotations to existing tool defs for the REST endpoint
+    // Serve a <=64-char, de-duplicated name to MCP clients (stdio path);
+    // callTool() reverses it back to the original for execution.
     return this.visibleToolDefs().map(tool => {
       const meta = (tool as any)._meta;
       const annotations = inferAnnotations(tool.name, meta);
       return {
         ...tool,
+        name: this.exposedName(tool),
+        inputSchema: this.relaxLocationRequirement((tool as any).inputSchema),
         annotations,
       };
     });
